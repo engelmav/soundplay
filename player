@@ -1,0 +1,127 @@
+#!/bin/bash
+
+set -e # Exit immediately if a command exits with a non-zero status.
+
+# --- Sound Card Auto-Detection ---
+echo "Attempting to auto-detect DAC8X sound card..."
+DETECTED_CARD_ID=""
+# Read /proc/asound/cards to find the DAC8X
+while IFS= read -r line || [[ -n "$line" ]]; do
+    # Check if the line contains 'dac8x' (case-insensitive)
+    if echo "$line" | grep -iq "dac8x"; then
+        # Extract the card number (the first field on the line)
+        DETECTED_CARD_ID=$(echo "$line" | awk '{print $1}')
+        break
+    fi
+done < /proc/asound/cards
+
+if [ -n "$DETECTED_CARD_ID" ]; then
+    ALSA_DEVICE_NAME="hw:$DETECTED_CARD_ID"
+    echo "Found DAC8X as card $DETECTED_CARD_ID. Using ALSA device: $ALSA_DEVICE_NAME"
+else
+    echo "ERROR: DAC8X sound card not found automatically."
+    echo "Please ensure it is connected and recognized by ALSA (check 'aplay -l' or '/proc/asound/cards')."
+    echo "You may need to manually set ALSA_DEVICE_NAME in this script."
+    exit 1
+fi
+# --- End Sound Card Auto-Detection ---
+
+
+# Configuration Variables
+JACKD_CMD="jackd"
+# ALSA_DEVICE_NAME is now set by auto-detection above
+JACKD_ARGS="-d alsa -P -d ${ALSA_DEVICE_NAME} -r 48000 -p 1024 -n 2 -o 8" # -i N for N inputs if needed
+
+LIBRESPOT_CMD="/home/vcaudo/librespot/target/release/librespot"
+LIBRESPOT_ARGS="--backend jackaudio --initial-volume 15"
+JALV_CMD="jalv.gtk"
+XOVER_PLUGIN_URI="http://lsp-plug.in/plugins/lv2/crossover_stereo"
+XOVER_CONFIG_DIR="$HOME/xover_80hz/" # Using $HOME for robust path expansion
+
+LIBRESPOT_JACK_CLIENT="librespot"
+XOVER_JACK_CLIENT_PREFIX="LSP Crossover Stereo x8" # Prefix used by jalv for LSP plugins
+
+# --- Process Management & Cleanup ---
+PIDS=()
+
+cleanup() {
+    echo "Cleaning up..."
+    if [ ${#PIDS[@]} -ne 0 ]; then
+        echo "Stopping background processes: ${PIDS[*]}"
+        # Send SIGTERM first, then SIGKILL after a delay if needed
+        kill ${PIDS[*]} 2>/dev/null || true
+        sleep 2 # Give processes a moment to terminate gracefully
+        kill -9 ${PIDS[*]} 2>/dev/null || true # Force kill if still running
+    fi
+    # Optional: Add jack_disconnect commands here if needed for a full cleanup
+    echo "Cleanup finished."
+}
+
+# Trap EXIT, SIGINT (Ctrl+C), SIGTERM signals to run the cleanup function
+trap cleanup EXIT SIGINT SIGTERM
+
+# --- Script Main Logic ---
+
+echo "Starting JACK Audio Server (jackd) with device ${ALSA_DEVICE_NAME}..."
+# Start jackd in the background. Output will go to console.
+# For silent operation, redirect stdout and stderr:
+# $JACKD_CMD $JACKD_ARGS > /dev/null 2>&1 &
+$JACKD_CMD $JACKD_ARGS &
+PIDS+=($!)
+echo "JACKD PID: $!"
+sleep 5 # Allow substantial time for JACK server to initialize fully
+
+# Basic check to see if jackd started (by checking if PID exists)
+# A more robust check would be to try a jack_lsp command
+if ! ps -p $! > /dev/null; then
+    echo "ERROR: jackd process with PID $! not found after startup. Exiting."
+    exit 1
+fi
+echo "jackd appears to have started."
+
+echo "Starting Librespot..."
+$LIBRESPOT_CMD $LIBRESPOT_ARGS &
+PIDS+=($!)
+sleep 2 # Allow time for librespot to register with JACK
+
+echo "Starting LSP Crossover plugin with JALV..."
+# Note: jalv might rename the client slightly. We'll use the prefix.
+# Ensure XOVER_CONFIG_DIR is correctly specified for jalv
+$JALV_CMD $XOVER_PLUGIN_URI -l $XOVER_CONFIG_DIR &
+PIDS+=($!)
+sleep 4 # Allow more time for LV2 plugin host and plugin to load
+
+echo "Connecting Librespot to Crossover..."
+jack_connect "${LIBRESPOT_JACK_CLIENT}:out_0" "${XOVER_JACK_CLIENT_PREFIX}:in_l"
+jack_connect "${LIBRESPOT_JACK_CLIENT}:out_1" "${XOVER_JACK_CLIENT_PREFIX}:in_r"
+
+echo "Connecting Crossover main outputs to DAC (L & R - Playback 1 & 2)..."
+jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_l" "system:playback_1"
+jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_r" "system:playback_2"
+
+echo "Connecting Crossover low-pass outputs to DAC (Subwoofer - Playback 3)..."
+jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0l" "system:playback_3"
+jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0r" "system:playback_3"
+
+# Example: Connecting additional crossover bands to other DAC outputs
+# The LSP Crossover Stereo x8 plugin creates outputs like: band0l, band0r, band1l, band1r, ..., band7l, band7r
+# Adjust these connections based on your speaker setup and how many crossover bands you are using.
+
+# echo "Connecting Crossover band1 outputs to DAC (Playback 4 & 5)..."
+# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band1l" "system:playback_4"
+# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band1r" "system:playback_5"
+#
+# echo "Connecting Crossover band2 outputs to DAC (Playback 6 & 7)..."
+# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band2l" "system:playback_6"
+# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band2r" "system:playback_7"
+#
+# echo "Connecting Crossover band3 output (left) to DAC (Playback 8)..."
+# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band3l" "system:playback_8"
+# # If using band3r for another purpose or summing, adjust accordingly.
+
+echo "Audio setup complete. Librespot is running."
+echo "Press Ctrl+C to stop and cleanup."
+
+# Keep the script running until explicitly stopped (e.g., by Ctrl+C, which triggers cleanup)
+# Otherwise, background jobs might be terminated when the script ends.
+wait
