@@ -100,8 +100,8 @@ start() {
         echo "Connecting JACK ports..."
         jack_connect "${LIBRESPOT_JACK_CLIENT}:out_0" "${XOVER_JACK_CLIENT_PREFIX}:in_l"
         jack_connect "${LIBRESPOT_JACK_CLIENT}:out_1" "${XOVER_JACK_CLIENT_PREFIX}:in_r"
-        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_l" "system:playback_1"
-        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_r" "system:playback_2"
+        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_l" "system:playback_3"
+        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_r" "system:playback_3"
         jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0l" "system:playback_3"
         jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0r" "system:playback_3"
 
