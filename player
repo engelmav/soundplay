@@ -34,7 +34,7 @@ fi
 # Configuration Variables
 JACKD_CMD="jackd"
 # ALSA_DEVICE_NAME is now set by auto-detection above
-JACKD_ARGS="-d alsa -P -d ${ALSA_DEVICE_NAME} -r 48000 -p 1024 -n 2 -o 8" # -i N for N inputs if needed
+JACKD_ARGS="-d alsa -P -d ${ALSA_DEVICE_NAME} -r 44100 -p 1024 -n 2 -o 8" # -i N for N inputs if needed
 
 LIBRESPOT_CMD="/home/vcaudo/librespot/target/release/librespot"
 LIBRESPOT_ARGS="--backend jackaudio --initial-volume 15"
