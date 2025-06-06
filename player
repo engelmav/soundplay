@@ -2,6 +2,10 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
+# --- Log and PID File Configuration ---
+LOG_FILE="$HOME/soundplay.log"
+PID_FILE="/tmp/soundplay.pids"
+
 # --- Sound Card Auto-Detection ---
 echo "Attempting to auto-detect DAC8X sound card..."
 DETECTED_CARD_ID=""
@@ -41,87 +45,135 @@ XOVER_CONFIG_DIR="$HOME/xover_80hz/" # Using $HOME for robust path expansion
 LIBRESPOT_JACK_CLIENT="librespot"
 XOVER_JACK_CLIENT_PREFIX="LSP Crossover Stereo x8" # Prefix used by jalv for LSP plugins
 
-# --- Process Management & Cleanup ---
-PIDS=()
+# --- Function Definitions ---
 
-cleanup() {
-    echo "Cleaning up..."
-    if [ ${#PIDS[@]} -ne 0 ]; then
-        echo "Stopping background processes: ${PIDS[*]}"
-        # Send SIGTERM first, then SIGKILL after a delay if needed
-        kill ${PIDS[*]} 2>/dev/null || true
-        sleep 2 # Give processes a moment to terminate gracefully
-        kill -9 ${PIDS[*]} 2>/dev/null || true # Force kill if still running
+start() {
+    if [ -f "$PID_FILE" ]; then
+        echo "Services appear to be running. PID file exists: $PID_FILE"
+        echo "If services are stopped, please remove the file and try again."
+        exit 1
     fi
-    # Optional: Add jack_disconnect commands here if needed for a full cleanup
-    echo "Cleanup finished."
+
+    echo "Starting services in the background..."
+    echo "Log output will be sent to $LOG_FILE"
+
+    # Run the main startup logic in a backgrounded subshell
+    # This allows the 'start' command to exit immediately while the services run.
+    (
+        # Redirect all output from this point forward within the subshell to the log file
+        exec > "$LOG_FILE" 2>&1
+        set -e # Ensure subshell exits on error
+
+        echo "--- Starting new session at $(date) ---"
+
+        # Clear old PIDs and create a new PID file
+        > "$PID_FILE"
+
+        echo "Starting JACK Audio Server (jackd) with device ${ALSA_DEVICE_NAME}..."
+        $JACKD_CMD $JACKD_ARGS &
+        JACK_PID=$!
+        echo $JACK_PID >> "$PID_FILE"
+        echo "JACKD started with PID: $JACK_PID"
+
+        sleep 5 # Allow time for JACK server to initialize
+
+        if ! ps -p $JACK_PID > /dev/null; then
+            echo "ERROR: jackd process failed to start. Check logs for details."
+            exit 1
+        fi
+        echo "jackd appears to have started successfully."
+
+        echo "Starting Librespot..."
+        $LIBRESPOT_CMD $LIBRESPOT_ARGS &
+        LIBRESPOT_PID=$!
+        echo $LIBRESPOT_PID >> "$PID_FILE"
+        echo "Librespot started with PID: $LIBRESPOT_PID"
+        sleep 2
+
+        echo "Starting LSP Crossover plugin with JALV..."
+        $JALV_CMD $XOVER_PLUGIN_URI -l $XOVER_CONFIG_DIR &
+        JALV_PID=$!
+        echo $JALV_PID >> "$PID_FILE"
+        echo "JALV started with PID: $JALV_PID"
+        sleep 4
+
+        echo "Connecting JACK ports..."
+        jack_connect "${LIBRESPOT_JACK_CLIENT}:out_0" "${XOVER_JACK_CLIENT_PREFIX}:in_l"
+        jack_connect "${LIBRESPOT_JACK_CLIENT}:out_1" "${XOVER_JACK_CLIENT_PREFIX}:in_r"
+        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_l" "system:playback_1"
+        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_r" "system:playback_2"
+        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0l" "system:playback_3"
+        jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0r" "system:playback_3"
+
+        echo "Audio setup complete. Services are running in the background."
+
+    ) & # Detach the subshell to run in the background
+
+    echo "Services are starting. Use './player log' to monitor or './player stop' to terminate."
 }
 
-# Trap EXIT, SIGINT (Ctrl+C), SIGTERM signals to run the cleanup function
-trap cleanup EXIT SIGINT SIGTERM
+stop() {
+    if [ ! -f "$PID_FILE" ]; then
+        echo "Services not running (or PID file not found at $PID_FILE)."
+        exit 1
+    fi
 
-# --- Script Main Logic ---
+    echo "Stopping services..."
+    # Read PIDs into an array, handling potential empty lines
+    PIDS=()
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && PIDS+=("$pid")
+    done < "$PID_FILE"
 
-echo "Starting JACK Audio Server (jackd) with device ${ALSA_DEVICE_NAME}..."
-# Start jackd in the background. Output will go to console.
-# For silent operation, redirect stdout and stderr:
-# $JACKD_CMD $JACKD_ARGS > /dev/null 2>&1 &
-$JACKD_CMD $JACKD_ARGS &
-PIDS+=($!)
-echo "JACKD PID: $!"
-sleep 5 # Allow substantial time for JACK server to initialize fully
+    if [ ${#PIDS[@]} -ne 0 ]; then
+        echo "Stopping PIDs: ${PIDS[*]}"
+        # Kill all processes gracefully first
+        kill ${PIDS[*]} 2>/dev/null || true
+        sleep 2
+        # Force kill any that remain
+        kill -9 ${PIDS[*]} 2>/dev/null || true
+    else
+        echo "PID file was empty. No processes to stop."
+    fi
 
-# Basic check to see if jackd started (by checking if PID exists)
-# A more robust check would be to try a jack_lsp command
-if ! ps -p $! > /dev/null; then
-    echo "ERROR: jackd process with PID $! not found after startup. Exiting."
+    rm -f "$PID_FILE"
+    echo "Services stopped and PID file removed."
+}
+
+log() {
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "Log file not found: $LOG_FILE"
+        echo "Have the services been started yet?"
+        exit 1
+    fi
+    echo "Tailing log file: $LOG_FILE (Press Ctrl+C to exit)"
+    tail -f "$LOG_FILE"
+}
+
+
+# --- Main Script Logic ---
+COMMAND="$1"
+
+if [ -z "$COMMAND" ]; then
+    echo "Usage: $0 {start|stop|log}"
     exit 1
 fi
-echo "jackd appears to have started."
 
-echo "Starting Librespot..."
-$LIBRESPOT_CMD $LIBRESPOT_ARGS &
-PIDS+=($!)
-sleep 2 # Allow time for librespot to register with JACK
+case "$COMMAND" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    log|logtail)
+        log
+        ;;
+    *)
+        echo "Error: Unknown command '$COMMAND'"
+        echo "Usage: $0 {start|stop|log}"
+        exit 1
+        ;;
+esac
 
-echo "Starting LSP Crossover plugin with JALV..."
-# Note: jalv might rename the client slightly. We'll use the prefix.
-# Ensure XOVER_CONFIG_DIR is correctly specified for jalv
-$JALV_CMD $XOVER_PLUGIN_URI -l $XOVER_CONFIG_DIR &
-PIDS+=($!)
-sleep 4 # Allow more time for LV2 plugin host and plugin to load
-
-echo "Connecting Librespot to Crossover..."
-jack_connect "${LIBRESPOT_JACK_CLIENT}:out_0" "${XOVER_JACK_CLIENT_PREFIX}:in_l"
-jack_connect "${LIBRESPOT_JACK_CLIENT}:out_1" "${XOVER_JACK_CLIENT_PREFIX}:in_r"
-
-echo "Connecting Crossover main outputs to DAC (L & R - Playback 1 & 2)..."
-jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_l" "system:playback_1"
-jack_connect "${XOVER_JACK_CLIENT_PREFIX}:out_r" "system:playback_2"
-
-echo "Connecting Crossover low-pass outputs to DAC (Subwoofer - Playback 3)..."
-jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0l" "system:playback_3"
-jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band0r" "system:playback_3"
-
-# Example: Connecting additional crossover bands to other DAC outputs
-# The LSP Crossover Stereo x8 plugin creates outputs like: band0l, band0r, band1l, band1r, ..., band7l, band7r
-# Adjust these connections based on your speaker setup and how many crossover bands you are using.
-
-# echo "Connecting Crossover band1 outputs to DAC (Playback 4 & 5)..."
-# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band1l" "system:playback_4"
-# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band1r" "system:playback_5"
-#
-# echo "Connecting Crossover band2 outputs to DAC (Playback 6 & 7)..."
-# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band2l" "system:playback_6"
-# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band2r" "system:playback_7"
-#
-# echo "Connecting Crossover band3 output (left) to DAC (Playback 8)..."
-# jack_connect "${XOVER_JACK_CLIENT_PREFIX}:band3l" "system:playback_8"
-# # If using band3r for another purpose or summing, adjust accordingly.
-
-echo "Audio setup complete. Librespot is running."
-echo "Press Ctrl+C to stop and cleanup."
-
-# Keep the script running until explicitly stopped (e.g., by Ctrl+C, which triggers cleanup)
-# Otherwise, background jobs might be terminated when the script ends.
-wait
+exit 0
